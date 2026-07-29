@@ -520,9 +520,6 @@ class App: AppCenterApplication {
             startingUpdater: false,
             updaterDelegate: App.sparkleDelegate!,
             userDriverDelegate: nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-            App.updaterController?.startUpdater()
-        }
         PreferencesEvents.initialize()
         BenchmarkRunner.startIfNeeded()
         showSettingsWindowOnFirstLaunchIfNeeded()
