@@ -29,7 +29,7 @@ jobs:
           if [[ -n "$latest" ]]; then sudo xcode-select -s "$latest/Contents/Developer"; fi
           xcodebuild -version
 
-      - name: Configure ad-hoc signing and version
+      - name: Configure version and ad-hoc Xcode signing
         run: |
           cat > config/local.xcconfig <<EOF
           CURRENT_PROJECT_VERSION = ${{ env.VERSION }}
@@ -52,10 +52,80 @@ jobs:
             | scripts/xcbeautify
           file "$XCODE_BUILD_PATH/$APP_NAME.app/Contents/MacOS/$APP_NAME"
 
+      # Xcode signs ad-hoc above, then we re-sign with the fork's self-signed certificate. An ad-hoc designated
+      # requirement is the binary's cdhash, so macOS would drop the Accessibility/Screen Recording grants on every
+      # update; a certificate-based one stays stable across builds. Sparkle's Autoupdate/Updater.app helpers keep
+      # their upstream Developer ID signatures, so frameworks are signed without --deep
+      - name: Sign with fork certificate
+        env:
+          CODESIGN_P12_BASE64: ${{ secrets.CODESIGN_P12_BASE64 }}
+          CODESIGN_P12_PASSWORD: ${{ secrets.CODESIGN_P12_PASSWORD }}
+        run: |
+          if [[ -z "$CODESIGN_P12_BASE64" || -z "$CODESIGN_P12_PASSWORD" ]]; then echo "CODESIGN_P12_BASE64/CODESIGN_P12_PASSWORD secrets are not set" >&2; exit 1; fi
+          keychain="$RUNNER_TEMP/codesign.keychain-db"
+          keychainPassword="$(uuidgen)"
+          p12="$RUNNER_TEMP/codesign.p12"
+          printf '%s' "$CODESIGN_P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$keychainPassword" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$keychainPassword" "$keychain"
+          security import "$p12" -k "$keychain" -P "$CODESIGN_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychainPassword" "$keychain" > /dev/null
+          rm -f "$p12"
+          # codesign on the runner only finds identities in keychains on the search list, and only matches the
+          # untrusted self-signed certificate by its SHA-1, not its name
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-certificate -c "AltTab Fork Code Signing" -Z "$keychain" | awk '/^SHA-1 hash:/ { print $3; exit }')"
+          if [[ -z "$identity" ]]; then security find-identity -p codesigning "$keychain"; echo "signing certificate not found" >&2; exit 1; fi
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          for framework in "$app"/Contents/Frameworks/*.framework; do
+            codesign --force --keychain "$keychain" --sign "$identity" --timestamp=none "$framework"
+          done
+          codesign --force --keychain "$keychain" --sign "$identity" --timestamp=none --options runtime --preserve-metadata=entitlements "$app"
+          security delete-keychain "$keychain"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dr - "$app"
+
       - name: Zip app
         run: |
           cd "$XCODE_BUILD_PATH"
           ditto -c -k --keepParent "$APP_NAME.app" "$APP_NAME-$VERSION.zip"
+
+      # The app reads its feed from releases/latest/download/appcast.xml, so each release carries a feed listing itself
+      - name: Sign update and generate appcast
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$SPARKLE_ED_PRIVATE_KEY" ]]; then echo "SPARKLE_ED_PRIVATE_KEY secret is not set" >&2; exit 1; fi
+          keyFile="$RUNNER_TEMP/sparkle_ed_private_key"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$keyFile"
+          zipName="$APP_NAME-$VERSION.zip"
+          edSignatureAndLength="$(vendor/Sparkle/bin/sign_update --ed-key-file "$keyFile" "$XCODE_BUILD_PATH/$zipName")"
+          rm -f "$keyFile"
+          minimumSystemVersion="$(awk -F ' = ' '/MACOSX_DEPLOYMENT_TARGET/ { print $2; }' < config/base.xcconfig)"
+          releaseUrl="https://github.com/${{ github.repository }}/releases"
+          cat > "$XCODE_BUILD_PATH/appcast.xml" <<EOF
+          <?xml version="1.0" standalone="yes"?>
+          <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+            <channel>
+              <title>alt-tab-macos</title>
+              <language>en</language>
+              <item>
+                <title>Version $VERSION</title>
+                <pubDate>$(date -u +'%a, %d %b %Y %H:%M:%S %z')</pubDate>
+                <sparkle:minimumSystemVersion>$minimumSystemVersion</sparkle:minimumSystemVersion>
+                <sparkle:releaseNotesLink>$releaseUrl/tag/v$VERSION</sparkle:releaseNotesLink>
+                <enclosure
+                  url="$releaseUrl/download/v$VERSION/$zipName"
+                  sparkle:version="$VERSION"
+                  sparkle:shortVersionString="$VERSION"
+                  $edSignatureAndLength
+                  type="application/octet-stream"/>
+              </item>
+            </channel>
+          </rss>
+          EOF
+          cat "$XCODE_BUILD_PATH/appcast.xml"
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
@@ -63,12 +133,16 @@ jobs:
           tag_name: v${{ env.VERSION }}
           name: AltTab ${{ env.VERSION }}
           fail_on_unmatched_files: true
-          files: ${{ env.XCODE_BUILD_PATH }}/${{ env.APP_NAME }}-${{ env.VERSION }}.zip
+          files: |
+            ${{ env.XCODE_BUILD_PATH }}/${{ env.APP_NAME }}-${{ env.VERSION }}.zip
+            ${{ env.XCODE_BUILD_PATH }}/appcast.xml
           body: |
-            Ad-hoc signed fork build of AltTab (not notarized).
+            Fork build of AltTab, signed with a self-signed certificate (not notarized).
+            Once installed, it updates itself from this repo's releases.
 
-            **First launch:** macOS Gatekeeper will warn because this build isn't
-            notarized. Either right-click the app and choose **Open**, or run:
+            **First install only:** macOS Gatekeeper blocks it because it isn't
+            notarized. Either open it once, then click **Open Anyway** in
+            System Settings → Privacy & Security, or run:
 
             ```
             xattr -cr /Applications/AltTab.app
