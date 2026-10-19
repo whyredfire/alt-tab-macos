@@ -89,7 +89,7 @@ jobs:
       - name: Zip app
         run: |
           cd "$XCODE_BUILD_PATH"
-          ditto -c -k --keepParent "$APP_NAME.app" "$APP_NAME-$VERSION.zip"
+          ditto -c -k --keepParent "$APP_NAME.app" "$APP_NAME.zip"
 
       # The app reads its feed from releases/latest/download/appcast.xml, so each release carries a feed listing itself
       - name: Sign update and generate appcast
@@ -99,7 +99,7 @@ jobs:
           if [[ -z "$SPARKLE_ED_PRIVATE_KEY" ]]; then echo "SPARKLE_ED_PRIVATE_KEY secret is not set" >&2; exit 1; fi
           keyFile="$RUNNER_TEMP/sparkle_ed_private_key"
           printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$keyFile"
-          zipName="$APP_NAME-$VERSION.zip"
+          zipName="$APP_NAME.zip"
           edSignatureAndLength="$(vendor/Sparkle/bin/sign_update --ed-key-file "$keyFile" "$XCODE_BUILD_PATH/$zipName")"
           rm -f "$keyFile"
           minimumSystemVersion="$(awk -F ' = ' '/MACOSX_DEPLOYMENT_TARGET/ { print $2; }' < config/base.xcconfig)"
@@ -134,7 +134,7 @@ jobs:
           name: AltTab ${{ env.VERSION }}
           fail_on_unmatched_files: true
           files: |
-            ${{ env.XCODE_BUILD_PATH }}/${{ env.APP_NAME }}-${{ env.VERSION }}.zip
+            ${{ env.XCODE_BUILD_PATH }}/${{ env.APP_NAME }}.zip
             ${{ env.XCODE_BUILD_PATH }}/appcast.xml
           body: |
             Fork build of AltTab, signed with a self-signed certificate (not notarized).
